@@ -38,8 +38,12 @@ type Config struct {
 	// Store
 	DBPath string
 
-	// Notifier
-	NtfyTopic string
+	// Notifier: "telegram" | "ntfy" | "none".
+	// Default: telegram when its token is set, else ntfy when its topic is set.
+	Notifier         string
+	NtfyTopic        string
+	TelegramBotToken string
+	TelegramChatID   string
 
 	// Poller
 	PollInterval        time.Duration
@@ -78,6 +82,8 @@ func Load() (*Config, error) {
 		GmailMaxResults:      getEnvInt64("GMAIL_MAX_RESULTS", 50),
 		DBPath:               getEnv("DB_PATH", "job_tracker.db"),
 		NtfyTopic:            os.Getenv("NTFY_TOPIC"),
+		TelegramBotToken:     os.Getenv("TELEGRAM_BOT_TOKEN"),
+		TelegramChatID:       os.Getenv("TELEGRAM_CHAT_ID"),
 		ConfidenceThreshold:  getEnvFloat("CONFIDENCE_THRESHOLD", 0.6),
 		FilterKeywords:       splitCSV(getEnv("FILTER_KEYWORDS", "")),
 		FilterExcludeDomains: splitCSV(getEnv("FILTER_EXCLUDE_DOMAINS", "")),
@@ -88,11 +94,27 @@ func Load() (*Config, error) {
 		WebPass:              os.Getenv("WEB_PASS"),
 	}
 
-	interval, err := time.ParseDuration(getEnv("POLL_INTERVAL", "15m"))
+	// 45s: the history check is nearly free, so a short interval gives
+	// near-real-time pickup without quota concerns.
+	interval, err := time.ParseDuration(getEnv("POLL_INTERVAL", "45s"))
 	if err != nil {
 		return nil, fmt.Errorf("invalid POLL_INTERVAL: %w", err)
 	}
 	cfg.PollInterval = interval
+
+	// Notifier selection: explicit NOTIFIER wins; otherwise pick whichever
+	// channel is configured.
+	cfg.Notifier = strings.ToLower(os.Getenv("NOTIFIER"))
+	if cfg.Notifier == "" {
+		switch {
+		case cfg.TelegramBotToken != "":
+			cfg.Notifier = "telegram"
+		case cfg.NtfyTopic != "":
+			cfg.Notifier = "ntfy"
+		default:
+			cfg.Notifier = "none"
+		}
+	}
 
 	return cfg, nil
 }

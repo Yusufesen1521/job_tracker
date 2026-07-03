@@ -9,12 +9,17 @@ when a status changes.
 
 - **Language:** Go 1.22+ (mostly standard library, minimal dependencies)
 - **DB:** SQLite — pure-Go driver (`modernc.org/sqlite`), no CGO
-- **Mail:** Official Gmail API + OAuth2 (not IMAP)
+- **Mail:** Official Gmail API + OAuth2 (not IMAP); near-real-time pickup via
+  cheap Gmail history polling
 - **Classification:** Pluggable `Classifier` interface — Google Gemini (free tier),
-  OpenRouter (free models) or Anthropic Claude
+  OpenRouter (free models) or Anthropic Claude; extracts the actual employer,
+  the position and the intermediary platform (LinkedIn, ATS, agency)
+- **Deduplication:** one row per company+position — confirmations from a job
+  board and the company itself merge, and a rejection folds into the same row
 - **Pre-screening:** Keyword filter, optionally backed by a small free LLM (hybrid mode)
-- **Notifications:** ntfy.sh, behind a `Notifier` interface
-- **UI:** `net/http` + `html/template`, single server-rendered table
+- **Notifications:** Telegram bot or ntfy.sh, behind a `Notifier` interface
+- **UI:** `net/http` + `html/template`, server-rendered; rows expand to the
+  application's full mail history with direct Gmail links
 
 > ⚠️ **Security:** This repo is public. No secret is ever committed.
 > `.env`, `credentials.json`, `token.json` and `*.db` are gitignored.
@@ -76,20 +81,27 @@ The command prints a URL. Open it in a browser and authorize your Gmail
 account; the code is captured automatically by a local callback server and
 **`token.json`** is saved (contains the refresh token; gitignored).
 
-### 5. ntfy.sh notifications (optional)
+### 5. Notifications (optional)
 
-1. Install the **ntfy** app on your phone (Android/iOS) or open https://ntfy.sh.
-2. Pick a hard-to-guess topic name (e.g. `job-tracker-x7f2k9`).
-3. Set `NTFY_TOPIC=https://ntfy.sh/job-tracker-x7f2k9` in `.env`.
-4. Subscribe to the same topic in the app. Leave empty to disable notifications.
+**Telegram (recommended):**
+1. Message [@BotFather](https://t.me/BotFather) on Telegram → `/newbot` → copy the **bot token**.
+2. Send your new bot any message (it cannot message you first).
+3. Open `https://api.telegram.org/bot<TOKEN>/getUpdates` in a browser and copy
+   the `"chat":{"id":...}` value.
+4. Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env`.
+
+**ntfy.sh (alternative):** install the ntfy app, pick a hard-to-guess topic and
+set `NTFY_TOPIC=https://ntfy.sh/<topic>`. Selection is automatic (`NOTIFIER`
+overrides it); leaving everything empty disables notifications.
 
 ## Running locally
 
 ```bash
-# Fetch-process once (for testing/cron):
+# Full-scan-process once (for testing/cron/backfill):
 go run ./cmd/poller --once
 
-# Run continuously (at POLL_INTERVAL):
+# Real-time mode: initial full scan, then new mails are picked up within
+# POLL_INTERVAL (default 45s) via cheap Gmail history polling:
 go run ./cmd/poller
 
 # Check LLM API health / quota status:
@@ -99,6 +111,11 @@ go run ./cmd/poller --check
 go run ./cmd/server
 # → http://localhost:8080
 ```
+
+In real-time mode only genuinely new mails are processed — the history call
+returns just new message IDs and costs almost nothing, so rate limits are not
+a concern. If the tracker was offline long enough for Gmail to forget the
+stored history ID (~a week), it self-heals with a full scan.
 
 ## LLM providers and quotas
 

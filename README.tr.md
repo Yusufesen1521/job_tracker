@@ -9,13 +9,18 @@ lokal/VPS dostu bir otomasyon.
 
 - **Dil:** Go 1.22+ (standart kütüphane ağırlıklı, minimum bağımlılık)
 - **DB:** SQLite — saf Go driver (`modernc.org/sqlite`), CGO gerekmez
-- **Mail:** Resmi Gmail API + OAuth2 (IMAP değil)
+- **Mail:** Resmi Gmail API + OAuth2 (IMAP değil); ucuz Gmail history
+  polling'i ile neredeyse anlık mail yakalama
 - **Sınıflandırma:** Takılabilir `Classifier` interface'i — Google Gemini
-  (ücretsiz katman), OpenRouter (ücretsiz modeller) veya Anthropic Claude
+  (ücretsiz katman), OpenRouter (ücretsiz modeller) veya Anthropic Claude;
+  gerçek işvereni, pozisyonu ve aracı platformu (LinkedIn, ATS, ajans) çıkarır
+- **Tekilleştirme:** Şirket+pozisyon başına tek satır — iş ilanı platformundan
+  ve şirketin kendisinden gelen onaylar birleşir, red maili aynı satıra işlenir
 - **Ön eleme:** Anahtar kelime filtresi, istenirse küçük ücretsiz bir LLM
   destekli (hibrit mod)
-- **Bildirim:** ntfy.sh, `Notifier` interface'i arkasında
-- **Arayüz:** `net/http` + `html/template`, tek sayfa sunucu-render tablo
+- **Bildirim:** Telegram botu veya ntfy.sh, `Notifier` interface'i arkasında
+- **Arayüz:** `net/http` + `html/template`, sunucu-render; satırlar tıklanınca
+  başvurunun tüm mail geçmişi Gmail linkleriyle açılır
 
 > ⚠️ **Güvenlik:** Bu repo public'tir. Hiçbir secret commit edilmez.
 > `.env`, `credentials.json`, `token.json`, `*.db` dosyaları `.gitignore`'dadır.
@@ -77,20 +82,27 @@ Komut bir URL basar. Tarayıcıda aç, Gmail hesabınla yetki ver; kod lokal bir
 callback sunucusu tarafından otomatik yakalanır ve **`token.json`** kaydedilir
 (refresh token içerir; `.gitignore`'dadır).
 
-### 5. ntfy.sh bildirimi (opsiyonel)
+### 5. Bildirim (opsiyonel)
 
-1. Telefonuna **ntfy** uygulamasını kur (Android/iOS) veya https://ntfy.sh aç.
-2. Tahmin edilmesi zor bir topic adı seç (örn. `job-tracker-x7f2k9`).
-3. `.env` içinde `NTFY_TOPIC=https://ntfy.sh/job-tracker-x7f2k9` olarak ayarla.
-4. Uygulamada aynı topic'e abone ol. Boş bırakırsan bildirim gönderilmez.
+**Telegram (önerilen):**
+1. Telegram'da [@BotFather](https://t.me/BotFather)'a yaz → `/newbot` → **bot token**'ı kopyala.
+2. Yeni botuna herhangi bir mesaj at (bot sana ilk mesajı atamaz).
+3. Tarayıcıda `https://api.telegram.org/bot<TOKEN>/getUpdates` aç ve
+   `"chat":{"id":...}` değerini kopyala.
+4. `.env`'de `TELEGRAM_BOT_TOKEN` ve `TELEGRAM_CHAT_ID` doldur.
+
+**ntfy.sh (alternatif):** ntfy uygulamasını kur, tahmin edilmesi zor bir topic
+seç ve `NTFY_TOPIC=https://ntfy.sh/<topic>` ayarla. Seçim otomatiktir
+(`NOTIFIER` ile ezilebilir); hepsi boşsa bildirim gönderilmez.
 
 ## Lokal çalıştırma
 
 ```bash
-# Bir kez çek-işle (test/cron için):
+# Bir kez tam tarama-işle (test/cron/geriye dönük doldurma için):
 go run ./cmd/poller --once
 
-# Sürekli çalış (POLL_INTERVAL aralığıyla):
+# Gerçek zamanlı mod: açılışta tam tarama, sonra yeni mailler POLL_INTERVAL
+# (varsayılan 45s) içinde ucuz Gmail history kontrolüyle yakalanır:
 go run ./cmd/poller
 
 # LLM API sağlık/kota kontrolü:
@@ -100,6 +112,11 @@ go run ./cmd/poller --check
 go run ./cmd/server
 # → http://localhost:8080
 ```
+
+Gerçek zamanlı modda yalnızca gerçekten yeni mailler işlenir — history isteği
+sadece yeni mail ID'lerini döndürür ve neredeyse hiç kota harcamaz; rate limit
+derdi yoktur. Uygulama uzun süre kapalı kalıp Gmail kayıtlı history ID'yi
+unutursa (~1 hafta) tam taramayla kendini onarır.
 
 ## LLM sağlayıcıları ve kotalar
 

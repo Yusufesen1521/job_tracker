@@ -15,8 +15,10 @@ type Email struct {
 // Result is the structured classification returned by the LLM.
 type Result struct {
 	IsJobRelated bool    `json:"is_job_related"`
-	Company      string  `json:"company"`
-	Status       string  `json:"status"` // applied | rejected | interview | offer
+	Company      string  `json:"company"`  // the actual employer, not the sending platform
+	Position     string  `json:"position"` // "" when the mail never names it
+	Via          string  `json:"via"`      // intermediary platform/agency ("" = direct)
+	Status       string  `json:"status"`   // applied | rejected | interview | offer
 	Confidence   float64 `json:"confidence"`
 }
 

@@ -7,7 +7,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -15,6 +17,7 @@ import (
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/gmail/v1"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 )
 
@@ -100,13 +103,76 @@ func (c *Client) List(ctx context.Context, query string, maxResults int64) ([]Me
 
 	out := make([]Message, 0, len(ids))
 	for _, id := range ids {
-		full, err := c.svc.Users.Messages.Get("me", id).Format("full").Context(ctx).Do()
+		m, err := c.GetMessage(ctx, id)
 		if err != nil {
-			return nil, fmt.Errorf("could not fetch message %s: %w", id, err)
+			return nil, err
 		}
-		out = append(out, toMessage(full))
+		out = append(out, m)
 	}
 	return out, nil
+}
+
+// GetMessage fetches a single mail by ID and converts it to a Message.
+func (c *Client) GetMessage(ctx context.Context, id string) (Message, error) {
+	full, err := c.svc.Users.Messages.Get("me", id).Format("full").Context(ctx).Do()
+	if err != nil {
+		return Message{}, fmt.Errorf("could not fetch message %s: %w", id, err)
+	}
+	return toMessage(full), nil
+}
+
+// ProfileHistoryID returns the mailbox's current historyId, used as the
+// starting point for incremental ListHistorySince polling.
+func (c *Client) ProfileHistoryID(ctx context.Context) (uint64, error) {
+	p, err := c.svc.Users.GetProfile("me").Context(ctx).Do()
+	if err != nil {
+		return 0, fmt.Errorf("could not fetch profile: %w", err)
+	}
+	return p.HistoryId, nil
+}
+
+// ListHistorySince returns the IDs of mails added since the given historyId.
+// This call is nearly free quota-wise and returns empty when nothing changed,
+// which makes short-interval near-real-time polling viable.
+//
+// expired=true means Gmail no longer remembers that historyId (it expires
+// after roughly a week); the caller should fall back to a full query scan
+// and fetch a fresh historyId via ProfileHistoryID.
+func (c *Client) ListHistorySince(ctx context.Context, historyID uint64) (msgIDs []string, newHistoryID uint64, expired bool, err error) {
+	newHistoryID = historyID
+	pageToken := ""
+	for {
+		call := c.svc.Users.History.List("me").
+			StartHistoryId(historyID).
+			HistoryTypes("messageAdded")
+		if pageToken != "" {
+			call = call.PageToken(pageToken)
+		}
+		resp, err := call.Context(ctx).Do()
+		if err != nil {
+			var gerr *googleapi.Error
+			if errors.As(err, &gerr) && gerr.Code == http.StatusNotFound {
+				// historyId expired: caller must resync with a full scan.
+				return nil, historyID, true, nil
+			}
+			return nil, historyID, false, fmt.Errorf("could not list history: %w", err)
+		}
+		if resp.HistoryId > newHistoryID {
+			newHistoryID = resp.HistoryId
+		}
+		for _, h := range resp.History {
+			for _, ma := range h.MessagesAdded {
+				if ma.Message != nil {
+					msgIDs = append(msgIDs, ma.Message.Id)
+				}
+			}
+		}
+		if resp.NextPageToken == "" {
+			break
+		}
+		pageToken = resp.NextPageToken
+	}
+	return msgIDs, newHistoryID, false, nil
 }
 
 // toMessage converts a Gmail API message into the simplified Message.

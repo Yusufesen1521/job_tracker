@@ -6,48 +6,73 @@
   <title>Job Application Tracker</title>
   <style>
     :root { color-scheme: light dark; }
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem auto; max-width: 960px; padding: 0 1rem; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem auto; max-width: 1080px; padding: 0 1rem; }
     h1 { font-size: 1.4rem; }
     .meta { color: #888; font-size: .85rem; margin-bottom: 1rem; }
-    table { border-collapse: collapse; width: 100%; }
-    th, td { text-align: left; padding: .55rem .6rem; border-bottom: 1px solid #8884; }
-    th { font-size: .8rem; text-transform: uppercase; letter-spacing: .03em; color: #888; }
-    tr:hover td { background: #8881; }
+
+    .head, .row {
+      display: grid;
+      grid-template-columns: 1.2fr .7fr 1fr 2fr .8fr .8fr;
+      gap: .6rem; align-items: center;
+      padding: .55rem .6rem; border-bottom: 1px solid #8884;
+    }
+    .head { font-size: .8rem; text-transform: uppercase; letter-spacing: .03em; color: #888; }
+    details > summary.row { cursor: pointer; list-style: none; }
+    details > summary.row::-webkit-details-marker { display: none; }
+    details[open] > summary.row, summary.row:hover { background: #8881; }
+
+    .company { font-weight: 600; }
+    .via { display: block; font-weight: 400; font-size: .75rem; color: #888; }
     .status { display: inline-block; padding: .15rem .5rem; border-radius: 999px; font-size: .8rem; font-weight: 600; }
     .applied   { background: #3b82f633; color: #3b82f6; }
     .interview { background: #f59e0b33; color: #f59e0b; }
     .offer     { background: #22c55e33; color: #22c55e; }
     .rejected  { background: #ef444433; color: #ef4444; }
+    .subject a { color: inherit; text-decoration: none; }
+    .subject a:hover { text-decoration: underline; }
+    .dim { color: #888; font-size: .85rem; }
+
+    .history { padding: .3rem .6rem .8rem 1.6rem; border-bottom: 1px solid #8884; background: #8880e; }
+    .history .mail { display: grid; grid-template-columns: .9fr .7fr 3fr; gap: .6rem; padding: .3rem 0; font-size: .88rem; }
+    .history .mail a { color: inherit; }
     .empty { color: #888; padding: 2rem 0; text-align: center; }
   </style>
 </head>
 <body>
   <h1>Job Application Tracker</h1>
-  <div class="meta">{{ .Total }} applications · updated {{ fmtTime .Generated }}</div>
+  <div class="meta">{{ .Total }} applications · updated {{ fmtTime .Generated }} · click a row for its mail history</div>
 
   {{ if .Apps }}
-  <table>
-    <thead>
-      <tr>
-        <th>Company</th>
-        <th>Status</th>
-        <th>Subject</th>
-        <th>Applied At</th>
-        <th>Last Update</th>
-      </tr>
-    </thead>
-    <tbody>
-      {{ range .Apps }}
-      <tr>
-        <td>{{ if .Company }}{{ .Company }}{{ else }}-{{ end }}</td>
-        <td><span class="status {{ .Status }}">{{ .Status }}</span></td>
-        <td>{{ .Subject }}</td>
-        <td>{{ fmtTime .AppliedAt }}</td>
-        <td>{{ fmtTime .UpdatedAt }}</td>
-      </tr>
+  <div class="head">
+    <div>Company</div><div>Status</div><div>Position</div><div>Latest Mail</div><div>Applied At</div><div>Last Update</div>
+  </div>
+  {{ range .Apps }}
+  <details>
+    <summary class="row">
+      <div class="company">{{ if .Company }}{{ .Company }}{{ else }}-{{ end }}
+        {{ if .Via }}<span class="via">via {{ .Via }}</span>{{ end }}
+      </div>
+      <div><span class="status {{ .Status }}">{{ .Status }}</span></div>
+      <div>{{ if .Position }}{{ .Position }}{{ else }}<span class="dim">-</span>{{ end }}</div>
+      <div class="subject">
+        {{ with index .Emails 0 }}
+        <a href="https://mail.google.com/mail/u/0/#all/{{ .GmailMessageID }}" target="_blank" rel="noopener">{{ .Subject }}</a>
+        {{ end }}
+      </div>
+      <div class="dim">{{ fmtTime .FirstEmailAt }}</div>
+      <div class="dim">{{ fmtTime .LastEmailAt }}</div>
+    </summary>
+    <div class="history">
+      {{ range .Emails }}
+      <div class="mail">
+        <span class="dim">{{ fmtTime .ReceivedAt }}</span>
+        <span><span class="status {{ .Status }}">{{ .Status }}</span></span>
+        <span class="subject"><a href="https://mail.google.com/mail/u/0/#all/{{ .GmailMessageID }}" target="_blank" rel="noopener">{{ .Subject }}</a></span>
+      </div>
       {{ end }}
-    </tbody>
-  </table>
+    </div>
+  </details>
+  {{ end }}
   {{ else }}
   <div class="empty">No applications yet. Run the poller: <code>go run ./cmd/poller --once</code></div>
   {{ end }}

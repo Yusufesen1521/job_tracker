@@ -67,7 +67,7 @@ func (h *handler) index(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	apps, err := h.db.List()
+	apps, err := h.db.ListWithEmails()
 	if err != nil {
 		http.Error(w, "database error", http.StatusInternalServerError)
 		log.Printf("list error: %v", err)

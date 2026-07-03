@@ -5,8 +5,9 @@
 //
 //	poller --auth   # first-time setup: runs OAuth and produces token.json
 //	poller --check  # tests whether the LLM API works / quota status
-//	poller --once   # fetch-process once and exit (ideal for cron)
-//	poller          # runs continuously at POLL_INTERVAL
+//	poller --once   # full-scan-process once and exit (ideal for cron/backfill)
+//	poller          # real-time mode: full scan once, then near-real-time
+//	                # Gmail history polling every POLL_INTERVAL (default 45s)
 package main
 
 import (
@@ -18,6 +19,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -28,10 +30,13 @@ import (
 	"github.com/Yusufesen1521/job_tracker/internal/store"
 )
 
+// metaHistoryKey is the meta table key holding the last processed Gmail historyId.
+const metaHistoryKey = "last_history_id"
+
 func main() {
 	var (
 		authFlag  = flag.Bool("auth", false, "run the OAuth flow and produce token.json")
-		onceFlag  = flag.Bool("once", false, "fetch-process once and exit (for cron)")
+		onceFlag  = flag.Bool("once", false, "full-scan-process once and exit (for cron)")
 		checkFlag = flag.Bool("check", false, "run an LLM API health/quota check and exit")
 	)
 	flag.Parse()
@@ -78,7 +83,6 @@ func main() {
 	}
 
 	filter := gmail.NewFilter(cfg.FilterKeywords, cfg.FilterExcludeDomains)
-	ntfy := notifier.NewNtfy(cfg.NtfyTopic)
 
 	// Hybrid pre-screening: ask a cheap LLM when no keyword matches.
 	var screener *classifier.Screener
@@ -97,23 +101,33 @@ func main() {
 		filter:   filter,
 		screener: screener,
 		clf:      clf,
-		ntfy:     ntfy,
+		ntfy:     newNotifier(cfg),
 	}
 
 	if *onceFlag {
-		if err := w.runOnce(ctx); err != nil {
+		if err := w.fullScan(ctx); err != nil {
 			log.Fatalf("run error: %v", err)
 		}
 		return
 	}
 
-	// Ticker mode: run once immediately, then continue at POLL_INTERVAL.
-	log.Printf("poller started, interval: %s", cfg.PollInterval)
-	if err := w.runOnce(ctx); err != nil {
-		log.Printf("initial run error: %v", err)
+	w.runRealtime(ctx)
+}
+
+// runRealtime does one full scan, then watches the mailbox via the Gmail
+// history API: a nearly-free "anything new?" call every POLL_INTERVAL that
+// returns only new message IDs, so only genuinely new mails are processed.
+func (w *worker) runRealtime(ctx context.Context) {
+	log.Printf("real-time mode: initial full scan, then history polling every %s", w.cfg.PollInterval)
+
+	if err := w.fullScan(ctx); err != nil {
+		log.Printf("initial scan error: %v", err)
+	}
+	if err := w.resyncHistoryID(ctx); err != nil {
+		log.Fatalf("could not fetch initial historyId: %v", err)
 	}
 
-	ticker := time.NewTicker(cfg.PollInterval)
+	ticker := time.NewTicker(w.cfg.PollInterval)
 	defer ticker.Stop()
 
 	// Catch signals for a clean shutdown.
@@ -123,14 +137,65 @@ func main() {
 	for {
 		select {
 		case <-ticker.C:
-			if err := w.runOnce(ctx); err != nil {
-				log.Printf("run error: %v", err)
+			if err := w.pollHistory(ctx); err != nil {
+				log.Printf("history poll error: %v", err)
 			}
 		case <-sig:
 			log.Println("shutdown signal received, exiting")
 			return
 		}
 	}
+}
+
+// pollHistory processes mails that arrived since the stored historyId.
+func (w *worker) pollHistory(ctx context.Context) error {
+	stored, err := w.db.GetMeta(metaHistoryKey)
+	if err != nil {
+		return err
+	}
+	historyID, _ := strconv.ParseUint(stored, 10, 64)
+	if historyID == 0 {
+		return w.resyncHistoryID(ctx)
+	}
+
+	msgIDs, newHistoryID, expired, err := w.gm.ListHistorySince(ctx, historyID)
+	if err != nil {
+		return err
+	}
+	if expired {
+		// historyId older than Gmail remembers (~a week offline): self-heal
+		// with a full scan and a fresh historyId.
+		log.Printf("historyId expired, resyncing with a full scan")
+		if err := w.fullScan(ctx); err != nil {
+			return err
+		}
+		return w.resyncHistoryID(ctx)
+	}
+
+	for _, id := range msgIDs {
+		m, err := w.gm.GetMessage(ctx, id)
+		if err != nil {
+			log.Printf("could not fetch new mail %s: %v", id, err)
+			continue
+		}
+		log.Printf("new mail: %s", m.Subject)
+		if err := w.processMessage(ctx, m, &screenerState{active: w.screener != nil}); err != nil {
+			// Quota exhausted: keep the old historyId so these mails are
+			// retried on a later poll, and surface the error.
+			return err
+		}
+	}
+
+	return w.db.SetMeta(metaHistoryKey, strconv.FormatUint(newHistoryID, 10))
+}
+
+// resyncHistoryID stores the mailbox's current historyId as the new baseline.
+func (w *worker) resyncHistoryID(ctx context.Context) error {
+	id, err := w.gm.ProfileHistoryID(ctx)
+	if err != nil {
+		return err
+	}
+	return w.db.SetMeta(metaHistoryKey, strconv.FormatUint(id, 10))
 }
 
 // newClassifier picks the Classifier implementation based on LLM_PROVIDER.
@@ -145,6 +210,20 @@ func newClassifier(cfg *config.Config) (classifier.Classifier, string) {
 	default: // gemini
 		return classifier.NewGemini(cfg.GeminiAPIKey, cfg.GeminiModel),
 			"gemini/" + cfg.GeminiModel
+	}
+}
+
+// newNotifier picks the Notifier implementation based on NOTIFIER.
+func newNotifier(cfg *config.Config) notifier.Notifier {
+	switch cfg.Notifier {
+	case "telegram":
+		log.Printf("notifications: telegram")
+		return notifier.NewTelegram(cfg.TelegramBotToken, cfg.TelegramChatID)
+	case "ntfy":
+		log.Printf("notifications: ntfy")
+		return notifier.NewNtfy(cfg.NtfyTopic)
+	default:
+		return notifier.NewNtfy("") // no-op
 	}
 }
 
@@ -166,15 +245,15 @@ func checkAPI(ctx context.Context, clf classifier.Classifier, provider string) e
 		return fmt.Errorf("API ERROR: %w", err)
 	}
 
-	fmt.Printf("OK — sample classification: job_related=%v company=%q status=%q confidence=%.2f\n",
-		res.IsJobRelated, res.Company, res.Status, res.Confidence)
+	fmt.Printf("OK — sample classification: job_related=%v company=%q position=%q status=%q confidence=%.2f\n",
+		res.IsJobRelated, res.Company, res.Position, res.Status, res.Confidence)
 	if !res.IsJobRelated || res.Status != "applied" {
 		fmt.Println("WARNING: the sample mail should have been classified as 'applied'; model behavior differs from expectations.")
 	}
 	return nil
 }
 
-// worker carries the dependencies of a single poll cycle.
+// worker carries the dependencies of the poller.
 type worker struct {
 	cfg      *config.Config
 	db       *store.Store
@@ -185,112 +264,126 @@ type worker struct {
 	ntfy     notifier.Notifier
 }
 
-// runOnce executes a single fetch-classify-store cycle.
-func (w *worker) runOnce(ctx context.Context) error {
+// screenerState tracks whether the screener is still usable within one scan;
+// it disables itself for the rest of the scan when its quota runs out.
+type screenerState struct {
+	active bool
+}
+
+// fullScan runs a fetch-classify-store cycle over the whole GMAIL_QUERY window.
+func (w *worker) fullScan(ctx context.Context) error {
 	msgs, err := w.gm.List(ctx, w.cfg.GmailQuery, w.cfg.GmailMaxResults)
 	if err != nil {
 		return err
 	}
 	log.Printf("fetched %d mails", len(msgs))
 
-	// If the screener quota runs out mid-cycle we stop asking for the rest;
-	// keyword-missed mails count as rejected this cycle (they are re-seen next cycle).
-	screenerActive := w.screener != nil
-
+	st := &screenerState{active: w.screener != nil}
 	for _, m := range msgs {
-		// 1) Dedup: skip mails processed before.
-		exists, err := w.db.MessageExists(m.ID)
-		if err != nil {
-			log.Printf("dedup check error (%s): %v", m.ID, err)
-			continue
+		if err := w.processMessage(ctx, m, st); err != nil {
+			return err
 		}
-		if exists {
-			continue
-		}
+	}
+	return nil
+}
 
-		// 2) Cheap pre-filter (+ the small-LLM second opinion in hybrid mode).
-		switch verdict, reason := w.filter.Verdict(m); verdict {
-		case gmail.ExcludedDomain:
+// processMessage runs one mail through the pipeline:
+// dedup → pre-filter (+screener) → classify → record → notify.
+// A non-nil error means the whole scan should stop (quota exhausted);
+// per-mail problems are logged and swallowed.
+func (w *worker) processMessage(ctx context.Context, m gmail.Message, st *screenerState) error {
+	// 1) Dedup: skip mails processed before.
+	exists, err := w.db.MessageExists(m.ID)
+	if err != nil {
+		log.Printf("dedup check error (%s): %v", m.ID, err)
+		return nil
+	}
+	if exists {
+		return nil
+	}
+
+	// 2) Cheap pre-filter (+ the small-LLM second opinion in hybrid mode).
+	switch verdict, reason := w.filter.Verdict(m); verdict {
+	case gmail.ExcludedDomain:
+		log.Printf("filter rejected (%s): %s", m.Subject, reason)
+		return nil
+	case gmail.NoKeyword:
+		if !st.active {
 			log.Printf("filter rejected (%s): %s", m.Subject, reason)
-			continue
-		case gmail.NoKeyword:
-			if !screenerActive {
-				log.Printf("filter rejected (%s): %s", m.Subject, reason)
-				continue
-			}
-			ok, err := w.screener.IsJobRelated(ctx, classifier.Email{
-				From: m.From, Subject: m.Subject, Body: bodyOrSnippet(m),
-			})
-			if err != nil {
-				if errors.Is(err, classifier.ErrQuotaExhausted) {
-					log.Printf("screener quota exhausted, disabled for this cycle: %v", err)
-					screenerActive = false
-				} else {
-					log.Printf("screener error (%s): %v", m.Subject, err)
-				}
-				continue
-			}
-			if !ok {
-				log.Printf("screener rejected (%s)", m.Subject)
-				continue
-			}
-			log.Printf("screener passed (%s) — no keyword had matched", m.Subject)
+			return nil
 		}
-
-		// 3) LLM classification.
-		res, err := w.clf.Classify(ctx, classifier.Email{
-			From:    m.From,
-			Subject: m.Subject,
-			Body:    bodyOrSnippet(m),
+		ok, err := w.screener.IsJobRelated(ctx, classifier.Email{
+			From: m.From, Subject: m.Subject, Body: bodyOrSnippet(m),
 		})
 		if err != nil {
-			// If the quota is exhausted, trying the remaining mails is pointless.
 			if errors.Is(err, classifier.ErrQuotaExhausted) {
-				return fmt.Errorf("LLM quota exhausted, cycle stopped (remaining mails next cycle): %w", err)
+				log.Printf("screener quota exhausted, disabled for this scan: %v", err)
+				st.active = false
+			} else {
+				log.Printf("screener error (%s): %v", m.Subject, err)
 			}
-			log.Printf("classification error (%s): %v", m.Subject, err)
-			continue
+			return nil
 		}
+		if !ok {
+			log.Printf("screener rejected (%s)", m.Subject)
+			return nil
+		}
+		log.Printf("screener passed (%s) — no keyword had matched", m.Subject)
+	}
 
-		// 4) Unrelated or low confidence → don't store.
-		if !res.IsJobRelated || res.Confidence < w.cfg.ConfidenceThreshold {
-			log.Printf("skipped (job_related=%v, conf=%.2f): %s", res.IsJobRelated, res.Confidence, m.Subject)
-			continue
+	// 3) LLM classification.
+	res, err := w.clf.Classify(ctx, classifier.Email{
+		From:    m.From,
+		Subject: m.Subject,
+		Body:    bodyOrSnippet(m),
+	})
+	if err != nil {
+		// If the quota is exhausted, continuing is pointless.
+		if errors.Is(err, classifier.ErrQuotaExhausted) {
+			return fmt.Errorf("LLM quota exhausted, scan stopped (remaining mails retried later): %w", err)
 		}
+		log.Printf("classification error (%s): %v", m.Subject, err)
+		return nil
+	}
 
-		// 5) Write to the DB (thread semantics).
-		raw, _ := json.Marshal(res)
-		now := time.Now().UTC()
-		applied := m.AppliedAt
-		if applied.IsZero() {
-			applied = now
-		}
-		up, err := w.db.UpsertByThread(store.Application{
-			Company:           res.Company,
-			Status:            res.Status,
-			EmailMessageID:    m.ID,
-			EmailThreadID:     m.ThreadID,
-			Subject:           m.Subject,
-			AppliedAt:         applied,
-			UpdatedAt:         now,
-			RawClassification: string(raw),
-		})
-		if err != nil {
-			log.Printf("DB write error (%s): %v", m.Subject, err)
-			continue
-		}
+	// 4) Unrelated or low confidence → don't store.
+	if !res.IsJobRelated || res.Confidence < w.cfg.ConfidenceThreshold {
+		log.Printf("skipped (job_related=%v, conf=%.2f): %s", res.IsJobRelated, res.Confidence, m.Subject)
+		return nil
+	}
 
-		// 6) Notify: new application or status change.
-		switch {
-		case up.Created:
-			log.Printf("new application: %s [%s]", res.Company, res.Status)
-			w.notify(ctx, "New application: "+res.Company,
-				res.Company+" — status: "+res.Status)
-		case up.StatusChanged:
-			log.Printf("status changed: %s [%s → %s]", res.Company, up.OldStatus, res.Status)
-			w.notify(ctx, "Status updated: "+res.Company,
-				res.Company+": "+up.OldStatus+" → "+res.Status)
-		}
+	// 5) Record: attach the mail to the right application (thread → company
+	// [+position] matching; status never moves backward).
+	raw, _ := json.Marshal(res)
+	received := m.AppliedAt
+	if received.IsZero() {
+		received = time.Now().UTC()
+	}
+	rec, err := w.db.RecordEmail(res.Company, res.Position, res.Via, res.Status, store.Email{
+		GmailMessageID:    m.ID,
+		GmailThreadID:     m.ThreadID,
+		FromAddr:          m.From,
+		Subject:           m.Subject,
+		RawClassification: string(raw),
+		ReceivedAt:        received,
+	})
+	if err != nil {
+		log.Printf("DB write error (%s): %v", m.Subject, err)
+		return nil
+	}
+
+	// 6) Notify: new application or status change.
+	label := res.Company
+	if res.Position != "" {
+		label += " (" + res.Position + ")"
+	}
+	switch {
+	case rec.Created:
+		log.Printf("new application: %s [%s]", label, res.Status)
+		w.notify(ctx, "New application: "+res.Company, label+" — status: "+res.Status)
+	case rec.StatusChanged:
+		log.Printf("status changed: %s [%s → %s]", label, rec.OldStatus, res.Status)
+		w.notify(ctx, "Status updated: "+res.Company, label+": "+rec.OldStatus+" → "+res.Status)
 	}
 	return nil
 }
