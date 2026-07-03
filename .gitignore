@@ -8,6 +8,11 @@
 *.so
 *.dylib
 
+# Compiled binaries (this project)
+/server
+/poller
+/bin/
+
 # Test binary, built with `go test -c`
 *.test
 
@@ -26,6 +31,18 @@ go.work.sum
 
 # env file
 .env
+
+# === SECRETS — these must NEVER be committed (public repo) ===
+# Gmail OAuth client secret and user token
+credentials.json
+token.json
+# SQLite database (contains personal mail data)
+*.db
+*.db-shm
+*.db-wal
+
+# Local tool settings
+.claude/settings.local.json
 
 # Editor/IDE
 # .idea/
